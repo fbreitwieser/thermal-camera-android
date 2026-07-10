@@ -17,7 +17,11 @@ Android app for USB thermal cameras (Infiray P2 Pro, Topdon TC001, and compatibl
 
 ## Supported Devices
 
-Tested: **Infiray P2 Pro**. Other Infiray/Topdon USB-C cameras likely compatible.
+Tested:
+
+- **Infiray P2 Pro**, 
+- **Topdon TC001**, 
+- Other Infiray/Topdon USB-C cameras likely compatible.
 
 Open an issue with vendor ID, product ID, and resolution for unsupported devices.
 
