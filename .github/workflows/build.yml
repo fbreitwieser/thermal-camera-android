@@ -1,5 +1,5 @@
 name: Android CI
-
+# manual build trigger
 on:
   push:
     branches: [ "**" ]
