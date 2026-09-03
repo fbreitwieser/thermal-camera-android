@@ -6,6 +6,8 @@
     <usb-device vendor-id="3034" product-id="22592" />
     <!-- Topdon TC001 thermal camera -->
     <usb-device vendor-id="3034" product-id="22593" />
+    <!-- Thermal Master P2 thermal camera -->
+    <usb-device vendor-id="13428" product-id="17025" />
     <!-- Generic Infiray thermal cameras -->
     <usb-device vendor-id="3034" />
 </resources>
