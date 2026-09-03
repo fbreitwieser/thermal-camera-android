@@ -32,6 +32,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:directBootAware="true"
+            android:launchMode="singleTask"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

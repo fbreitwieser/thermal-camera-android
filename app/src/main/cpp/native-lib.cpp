@@ -3,6 +3,7 @@
 #include <atomic>
 #include <mutex>
 #include <cmath>
+#include <cstring>
 #include <thread>
 #include <chrono>
 #include <android/log.h>
@@ -15,11 +16,26 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Frame dimensions for Infiray P2 / Topdon TC001
+// Output dimensions shared by all supported cameras
 static constexpr int FRAME_WIDTH = 256;
-static constexpr int FRAME_HEIGHT = 384;
-static constexpr int IMAGE_HEIGHT = 192;   // Top half: visual image
-static constexpr int THERMAL_HEIGHT = 192; // Bottom half: thermal data
+static constexpr int IMAGE_HEIGHT = 192;   // Top of frame: visual image
+static constexpr int THERMAL_HEIGHT = 192; // Below: 16-bit thermal data
+
+struct DeviceGeometry {
+    int frameHeight;
+    int thermalStartRow;
+};
+
+static constexpr DeviceGeometry INFIRAY_GEOMETRY = {384, 192};
+static constexpr DeviceGeometry THERMAL_MASTER_P2_GEOMETRY = {386, 194};
+static DeviceGeometry g_geometry = INFIRAY_GEOMETRY;
+
+static DeviceGeometry selectDeviceGeometry(jint vendorId, jint productId) {
+    if (vendorId == 0x3474 && productId == 0x4281) {
+        return THERMAL_MASTER_P2_GEOMETRY;
+    }
+    return INFIRAY_GEOMETRY;
+}
 
 // Global state
 static uvc_context_t *g_ctx = nullptr;
@@ -31,6 +47,66 @@ static std::mutex g_mutex;
 static JavaVM *g_jvm = nullptr;
 static jobject g_callback_obj = nullptr;
 static jmethodID g_callback_method = nullptr;
+
+static uvc_error_t getStreamCtrlForAnyFrameRate(
+        uvc_device_handle_t *devh,
+        uvc_stream_ctrl_t *ctrl,
+        int width,
+        int height) {
+    static constexpr uint8_t YUYV_GUID[16] = {
+            'Y', 'U', 'Y', '2', 0x00, 0x00, 0x10, 0x00,
+            0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71
+    };
+
+    const uvc_format_desc_t *format = uvc_get_format_descs(devh);
+    for (; format != nullptr; format = format->next) {
+        if (std::memcmp(format->guidFormat, YUYV_GUID, sizeof(YUYV_GUID)) != 0) {
+            continue;
+        }
+        for (const uvc_frame_desc_t *frame = format->frame_descs;
+             frame != nullptr; frame = frame->next) {
+            if (frame->wWidth != width || frame->wHeight != height) {
+                continue;
+            }
+            if (frame->intervals != nullptr) {
+                for (const uint32_t *interval = frame->intervals; *interval != 0; ++interval) {
+                    int fps = static_cast<int>(10000000 / *interval);
+                    if (fps > 0) {
+                        uvc_error_t res = uvc_get_stream_ctrl_format_size(
+                                devh, ctrl, UVC_FRAME_FORMAT_YUYV, width, height, fps);
+                        if (res == UVC_SUCCESS) {
+                            LOGI("Falling back to %d fps (advertised)", fps);
+                            return res;
+                        }
+                    }
+                }
+            } else {
+                if (frame->dwMinFrameInterval == 0 ||
+                    frame->dwMaxFrameInterval < frame->dwMinFrameInterval ||
+                    frame->dwFrameIntervalStep == 0) {
+                    continue;
+                }
+                uint32_t minFps = static_cast<uint32_t>(
+                        (10000000ULL + frame->dwMaxFrameInterval - 1) /
+                        frame->dwMaxFrameInterval);
+                uint32_t maxFps = 10000000 / frame->dwMinFrameInterval;
+                for (uint32_t fps = minFps; fps <= maxFps; ++fps) {
+                    uint32_t interval = 10000000 / fps;
+                    uint32_t offset = interval - frame->dwMinFrameInterval;
+                    if (interval >= frame->dwMinFrameInterval &&
+                        interval <= frame->dwMaxFrameInterval &&
+                        !(offset && offset % frame->dwFrameIntervalStep)) {
+                        LOGI("Falling back to %u fps (continuous range)", fps);
+                        return uvc_get_stream_ctrl_format_size(
+                                devh, ctrl, UVC_FRAME_FORMAT_YUYV,
+                                width, height, static_cast<int>(fps));
+                    }
+                }
+            }
+        }
+    }
+    return UVC_ERROR_INVALID_MODE;
+}
 
 // Convert raw thermal value to Celsius
 static inline float rawToCelsius(uint16_t raw) {
@@ -74,8 +150,7 @@ static void frameCallback(uvc_frame_t *frame, void *user_ptr) {
         return;
     }
 
-    // Expected: 256x384 YUYV = 256 * 384 * 2 bytes
-    size_t expected_size = FRAME_WIDTH * FRAME_HEIGHT * 2;
+    size_t expected_size = FRAME_WIDTH * g_geometry.frameHeight * 2;
     if (frame->data_bytes < expected_size) {
         LOGE("Frame too small: %zu < %zu", frame->data_bytes, expected_size);
         return;
@@ -96,12 +171,12 @@ static void frameCallback(uvc_frame_t *frame, void *user_ptr) {
         }
     }
 
-    // Process thermal data from bottom 192 rows
+    // Process the 192 thermal rows, which start at a device-specific offset
     // Each pixel is 16-bit LE stored in YUYV as: lo byte in Y, hi byte in U/V
     float minTemp = 1000.0f, maxTemp = -1000.0f, sumTemp = 0.0f;
     int minRow = 0, minCol = 0, maxRow = 0, maxCol = 0;
 
-    uint8_t *thermal_data = data + (IMAGE_HEIGHT * stride);
+    uint8_t *thermal_data = data + (g_geometry.thermalStartRow * stride);
 
     for (int y = 0; y < THERMAL_HEIGHT; y++) {
         for (int x = 0; x < FRAME_WIDTH; x++) {
@@ -291,6 +366,11 @@ Java_com_breyt_thermalcamera_ThermalCamera_nativeOpen(
             uvc_stop_streaming(g_devh);
             g_streaming = false;
         }
+        if (g_callback_obj) {
+            env->DeleteGlobalRef(g_callback_obj);
+            g_callback_obj = nullptr;
+        }
+        g_callback_method = nullptr;
         if (g_devh) {
             uvc_close(g_devh);
             g_devh = nullptr;
@@ -306,6 +386,9 @@ Java_com_breyt_thermalcamera_ThermalCamera_nativeOpen(
     }
 
     LOGI("Opening camera with fd=%d, VID=%04x, PID=%04x", fd, vendorId, productId);
+    g_geometry = selectDeviceGeometry(vendorId, productId);
+    LOGI("Using frame 256x%d, thermal data at row %d",
+         g_geometry.frameHeight, g_geometry.thermalStartRow);
 
     // On Android, we must set LIBUSB_OPTION_NO_DEVICE_DISCOVERY before init
     // because Android restricts direct access to /dev/bus/usb.
@@ -392,22 +475,19 @@ Java_com_breyt_thermalcamera_ThermalCamera_nativeStartStream(
     // Reset frame counter
     g_frame_count = 0;
 
-    // Configure stream: 256x384 YUYV @ 25fps
+    // Configure stream: YUYV @ 25fps at the device's frame height
     uvc_stream_ctrl_t ctrl;
     uvc_error_t res = uvc_get_stream_ctrl_format_size(
             g_devh, &ctrl,
             UVC_FRAME_FORMAT_YUYV,
-            FRAME_WIDTH, FRAME_HEIGHT, 25);
+            FRAME_WIDTH, g_geometry.frameHeight, 25);
 
     if (res < 0) {
         LOGE("uvc_get_stream_ctrl_format_size failed: %s", uvc_strerror(res));
-        // Try without specific fps
-        res = uvc_get_stream_ctrl_format_size(
-                g_devh, &ctrl,
-                UVC_FRAME_FORMAT_YUYV,
-                FRAME_WIDTH, FRAME_HEIGHT, 0);
+        res = getStreamCtrlForAnyFrameRate(
+                g_devh, &ctrl, FRAME_WIDTH, g_geometry.frameHeight);
         if (res < 0) {
-            LOGE("uvc_get_stream_ctrl_format_size (fps=0) failed: %s", uvc_strerror(res));
+            LOGE("No supported frame rate found: %s", uvc_strerror(res));
             env->DeleteGlobalRef(g_callback_obj);
             g_callback_obj = nullptr;
             return JNI_FALSE;
